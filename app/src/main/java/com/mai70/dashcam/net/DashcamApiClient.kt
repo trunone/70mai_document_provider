@@ -1,13 +1,16 @@
 package com.mai70.dashcam.net
 
 import android.util.Log
+import com.github.trunone.mai70protocol.Mai70Protocol
+import com.github.trunone.mai70protocol.models.Authority
+import com.github.trunone.mai70protocol.models.Category
+import com.github.trunone.mai70protocol.models.FileEntry
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import java.io.IOException
-import java.io.InputStream
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
-import java.util.regex.Pattern
 
 /**
  * Represents a file or directory entry on the 70mai Dashcam HTTP server.
@@ -29,103 +32,314 @@ data class DashcamFileItem(
 )
 
 /**
- * Client for interacting with the 70mai Dashcam HTTP web server (default IP: 192.168.0.1).
- *
- * Handles directory listing, metadata extraction, and ranged HTTP byte streaming for SAF playback.
+ * Client for interacting with 70mai Dashcam using reverse-engineered Wi-Fi/HTTP CGI protocol.
  */
 class DashcamApiClient(
-    private val baseUrl: String = DEFAULT_BASE_URL,
-    private val okHttpClient: OkHttpClient = defaultClient()
+    val host: String = DEFAULT_HOST,
+    val port: Int = DEFAULT_PORT,
+    private val okHttpClient: OkHttpClient = defaultClient(),
+    var token: String = ""
 ) {
+    private val fileEntriesCache = ConcurrentHashMap<String, FileEntry>()
+
+    fun getAuthority(): Authority = Authority(host = host, port = port, token = token)
 
     /**
-     * Lists files and subdirectories under the given directory path.
-     *
-     * Supports standard 70mai paths like "/", "/sd/", "/sd/normal/", "/sd/event/", "/sd/photo/".
-     *
-     * @param directoryPath Path to query, e.g., "/sd/normal/".
-     * @return List of [DashcamFileItem] entries found in the directory.
-     * @throws IOException If the network request fails or HTTP error response received.
+     * Executes client registration (`client.cgi`) with the dashcam.
      */
-    @Throws(IOException::class)
-    fun listDirectory(directoryPath: String): List<DashcamFileItem> {
-        val normalizedPath = sanitizePath(directoryPath)
-        val url = buildUrl(normalizedPath)
+    fun register(clientIp: String = "192.168.0.2"): Boolean {
+        val authority = getAuthority()
+        val timestamp = System.currentTimeMillis() / 1000L
+        val queryPath = "client.cgi?"
+        val queryParams = "&-operation=register&-ip=$clientIp&-timestamp=$timestamp"
 
-        val request = Request.Builder()
-            .url(url)
-            .get()
-            .build()
-
-        okHttpClient.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) {
-                throw IOException("Failed to fetch directory listing from $url: HTTP ${response.code}")
+        val url = Mai70Protocol.buildCgiUrl(authority, queryPath, queryParams)
+        val request = Request.Builder().url(url).get().build()
+        return try {
+            okHttpClient.newCall(request).execute().use { response ->
+                val bodyText = response.body?.string()
+                Mai70Protocol.isSuccessResponse(bodyText)
             }
-
-            val bodyText = response.body?.string() ?: ""
-            return parseHtmlDirectoryListing(normalizedPath, bodyText)
+        } catch (e: Exception) {
+            Log.w(TAG, "register failed", e)
+            false
         }
     }
 
     /**
-     * Queries metadata for a specific file path on the dashcam.
+     * Sets access album mode (`setaccessalbum.cgi`).
+     * Pauses camera recording and enables file listing / access on supported models.
+     */
+    fun setAlbumMode(enable: Boolean): Boolean {
+        val authority = getAuthority()
+        val timestamp = System.currentTimeMillis() / 1000L
+        val enableValue = if (enable) 0 else 1
+
+        val queryPath = "setaccessalbum.cgi?"
+        val queryParamsCandidates = listOf(
+            "&-enable=$enableValue&-timestamp=$timestamp",
+            "-enable=$enableValue&-timestamp=$timestamp"
+        )
+
+        for (queryParams in queryParamsCandidates) {
+            val url = Mai70Protocol.buildCgiUrl(authority, queryPath, queryParams)
+            val request = Request.Builder().url(url).get().build()
+            try {
+                okHttpClient.newCall(request).execute().use { response ->
+                    val bodyText = response.body?.string()
+                    if (Mai70Protocol.isSuccessResponse(bodyText)) {
+                        return true
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "setAlbumMode request failed for candidate $queryParams", e)
+            }
+        }
+        return false
+    }
+
+    /**
+     * Prepares camera access before listing or fetching files.
+     */
+    fun prepareCameraAccess() {
+        try {
+            register()
+        } catch (_: Exception) {}
+        try {
+            setAlbumMode(enable = true)
+        } catch (_: Exception) {}
+    }
+
+    /**
+     * Lists files for a specific Category using `getfilelist.cgi`.
+     */
+    @Throws(IOException::class)
+    fun listFiles(category: Category): List<FileEntry> {
+        prepareCameraAccess()
+        val authority = getAuthority()
+        val allEntries = mutableListOf<FileEntry>()
+        var startIndex = 0
+        val pageSize = 100
+
+        while (true) {
+            val timestamp = System.currentTimeMillis() / 1000L
+            val queryPath = "getfilelist.cgi?"
+            val queryParams = "-start=$startIndex&-end=${startIndex + pageSize - 1}&-type=${category.type}&-timestamp=$timestamp"
+            val url = Mai70Protocol.buildCgiUrl(authority, queryPath, queryParams)
+
+            val request = Request.Builder().url(url).get().build()
+            val responseText = try {
+                okHttpClient.newCall(request).execute().use { it.body?.string() }
+            } catch (e: Exception) {
+                throw IOException("Network error while listing files for category ${category.categoryName}: ${e.message}", e)
+            }
+
+            var batch = Mai70Protocol.parseFileListResponse(responseText, category)
+
+            // Fallback strategy if initial batch on page 0 is empty
+            if ((batch == null || batch.isEmpty()) && startIndex == 0) {
+                val fallbackFormats = listOf(0, 1, 2, 3)
+                for (format in fallbackFormats) {
+                    val altTimestamp = System.currentTimeMillis() / 1000L
+                    val altUrl = when (format) {
+                        0 -> {
+                            val qp = "&-start=0&-end=${pageSize - 1}&-type=${category.type}&-timestamp=$altTimestamp"
+                            Mai70Protocol.buildCgiUrl(authority, queryPath, qp)
+                        }
+                        1 -> {
+                            val qp = "-start=0&-end=${pageSize - 1}&-timestamp=$altTimestamp"
+                            Mai70Protocol.buildCgiUrl(authority, queryPath, qp)
+                        }
+                        2 -> {
+                            val qp = "start=0&end=${pageSize - 1}&type=${category.type}&timestamp=$altTimestamp"
+                            Mai70Protocol.buildCgiUrl(authority, queryPath, qp)
+                        }
+                        3 -> {
+                            val qp = "-start=1&-end=$pageSize&-type=${category.type}&-timestamp=$altTimestamp"
+                            Mai70Protocol.buildCgiUrl(authority, queryPath, qp)
+                        }
+                        else -> continue
+                    }
+
+                    val altRequest = Request.Builder().url(altUrl).get().build()
+                    val altText = try {
+                        okHttpClient.newCall(altRequest).execute().use { it.body?.string() }
+                    } catch (_: Exception) { null }
+
+                    val altBatch = Mai70Protocol.parseFileListResponse(altText, category)
+                    if (!altBatch.isNullOrEmpty()) {
+                        batch = altBatch
+                        break
+                    }
+                }
+            }
+
+            if (batch.isNullOrEmpty()) {
+                break
+            }
+
+            for (entry in batch) {
+                val fullRemotePath = "/${category.categoryName}/${entry.name}"
+                val cacheKey = "$host:$port/${fullRemotePath.removePrefix("/")}"
+                fileEntriesCache[cacheKey] = entry
+            }
+
+            allEntries.addAll(batch)
+            if (batch.size < pageSize) {
+                break
+            }
+
+            startIndex += pageSize
+        }
+
+        return allEntries
+    }
+
+    /**
+     * Lists files and subdirectories under the given directory path for SAF navigation.
      *
-     * Uses HEAD request when possible, falling back to directory parsing or default estimates.
+     * Directory paths correspond to root `/`, category folders like `/Normal`, `/Event`, etc.,
+     * or lower case `/sd/normal`.
+     */
+    @Throws(IOException::class)
+    fun listDirectory(directoryPath: String): List<DashcamFileItem> {
+        val cleanPath = sanitizePath(directoryPath)
+
+        // Root path: return Virtual root directories matching Category enum
+        if (cleanPath == "/" || cleanPath.isEmpty()) {
+            val categories = listOf(Category.NORMAL, Category.EVENT, Category.PARKING, Category.PHOTO, Category.TIME_LAPSE)
+            return categories.map { cat ->
+                DashcamFileItem(
+                    name = cat.categoryName,
+                    path = "/${cat.categoryName}",
+                    isDirectory = true,
+                    mimeType = "vnd.android.document/directory"
+                )
+            }
+        }
+
+        // Handle /sd or /sd/ directory requests if requested
+        if (cleanPath == "/sd" || cleanPath == "/sd/") {
+            val categories = listOf(Category.NORMAL, Category.EVENT, Category.PARKING, Category.PHOTO, Category.TIME_LAPSE)
+            return categories.map { cat ->
+                DashcamFileItem(
+                    name = cat.categoryName,
+                    path = "/sd/${cat.categoryName}",
+                    isDirectory = true,
+                    mimeType = "vnd.android.document/directory"
+                )
+            }
+        }
+
+        // Determine Category from directory path
+        val folderName = cleanPath.substringAfterLast('/').ifEmpty { cleanPath.removePrefix("/") }
+        val category = Category.fromName(folderName)
+
+        if (category == Category.UNKNOWN) {
+            return emptyList()
+        }
+
+        val entries = listFiles(category)
+        return entries.map { entry ->
+            val itemPath = if (cleanPath.endsWith("/")) "$cleanPath${entry.name}" else "$cleanPath/${entry.name}"
+            DashcamFileItem(
+                name = entry.name,
+                path = itemPath,
+                isDirectory = false,
+                size = entry.size,
+                mimeType = getMimeTypeForPath(entry.name)
+            )
+        }
+    }
+
+    /**
+     * Generates candidate HTTP URLs for downloading file entry content.
+     */
+    fun getFileUrlCandidates(
+        categoryName: String,
+        fileName: String,
+        remotePath: String? = null
+    ): List<String> {
+        val candidates = mutableListOf<String>()
+        val cleanCategory = categoryName.removePrefix("/").removeSuffix("/")
+        val cacheKey = "$host:$port/$cleanCategory/$fileName"
+        val cachedEntry = fileEntriesCache[cacheKey]
+
+        candidates.add("http://$host:$port/$cleanCategory/$fileName")
+        if (cachedEntry != null) {
+            val entryPath = cachedEntry.path.removePrefix("/").removeSuffix("/")
+            candidates.add("http://$host:$port/$entryPath/${cachedEntry.name}")
+            candidates.add("http://$host:$port/sd/$entryPath/${cachedEntry.name}")
+        } else if (!remotePath.isNullOrEmpty()) {
+            val cleanRemotePath = remotePath.removePrefix("/").removeSuffix("/")
+            candidates.add("http://$host:$port/$cleanRemotePath/$fileName")
+            candidates.add("http://$host:$port/sd/$cleanRemotePath/$fileName")
+        }
+        candidates.add("http://$host:$port/sd/$cleanCategory/$fileName")
+        candidates.add("http://$host:$port/$fileName")
+
+        return candidates.distinct()
+    }
+
+    /**
+     * Queries metadata for a specific file path on the dashcam.
      */
     @Throws(IOException::class)
     fun getFileMetadata(filePath: String): DashcamFileItem {
         val normalizedPath = sanitizePath(filePath)
         val fileName = normalizedPath.substringAfterLast('/')
-        val url = buildUrl(normalizedPath)
+        val parentPath = getParentPath(normalizedPath)
 
-        val request = Request.Builder()
-            .url(url)
-            .head()
-            .build()
+        val children = try {
+            listDirectory(parentPath)
+        } catch (_: Exception) { emptyList() }
 
-        try {
-            okHttpClient.newCall(request).execute().use { response ->
-                if (response.isSuccessful) {
-                    val contentLength = response.header("Content-Length")?.toLongOrNull() ?: 0L
-                    val mimeType = getMimeTypeForPath(normalizedPath)
-                    return DashcamFileItem(
-                        name = fileName,
-                        path = normalizedPath,
-                        isDirectory = false,
-                        size = contentLength,
-                        mimeType = mimeType
-                    )
-                }
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "HEAD request failed for $normalizedPath, falling back to parent list parse", e)
+        val found = children.firstOrNull { it.path == normalizedPath || it.name == fileName }
+        if (found != null) {
+            return found
         }
 
-        // Fallback: list parent directory and find exact item
-        val parentPath = getParentPath(normalizedPath)
-        val children = listDirectory(parentPath)
-        return children.firstOrNull { it.path == normalizedPath || it.name == fileName }
-            ?: DashcamFileItem(
-                name = fileName,
-                path = normalizedPath,
-                isDirectory = false,
-                size = 0L,
-                mimeType = getMimeTypeForPath(normalizedPath)
-            )
+        // Fallback: try probing candidate HTTP HEAD requests
+        val categoryName = parentPath.substringAfterLast('/')
+        val candidates = getFileUrlCandidates(categoryName, fileName)
+        for (url in candidates) {
+            val request = Request.Builder().url(url).head().build()
+            try {
+                okHttpClient.newCall(request).execute().use { response ->
+                    if (response.isSuccessful) {
+                        val contentLength = response.header("Content-Length")?.toLongOrNull() ?: 0L
+                        return DashcamFileItem(
+                            name = fileName,
+                            path = normalizedPath,
+                            isDirectory = false,
+                            size = contentLength,
+                            mimeType = getMimeTypeForPath(normalizedPath)
+                        )
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+
+        return DashcamFileItem(
+            name = fileName,
+            path = normalizedPath,
+            isDirectory = false,
+            size = 0L,
+            mimeType = getMimeTypeForPath(normalizedPath)
+        )
     }
 
     /**
      * Reads a byte range from a file on the dashcam server for random access / seeking.
-     *
-     * @param filePath File path relative to root.
-     * @param offset Byte offset to start reading from.
-     * @param size Number of bytes requested to read.
-     * @return [Response] containing the HTTP response input stream. **Caller must close response!**
      */
     @Throws(IOException::class)
     fun openRangeStream(filePath: String, offset: Long, size: Int): Response {
         val normalizedPath = sanitizePath(filePath)
-        val url = buildUrl(normalizedPath)
+        val fileName = normalizedPath.substringAfterLast('/')
+        val parentPath = getParentPath(normalizedPath)
+        val categoryName = parentPath.substringAfterLast('/')
+
+        val candidates = getFileUrlCandidates(categoryName, fileName)
 
         val rangeHeader = if (size > 0) {
             "bytes=$offset-${offset + size - 1}"
@@ -133,18 +347,26 @@ class DashcamApiClient(
             "bytes=$offset-"
         }
 
-        val request = Request.Builder()
-            .url(url)
-            .header("Range", rangeHeader)
-            .get()
-            .build()
+        var lastException: IOException? = null
+        for (url in candidates) {
+            val request = Request.Builder()
+                .url(url)
+                .header("Range", rangeHeader)
+                .get()
+                .build()
 
-        val response = okHttpClient.newCall(request).execute()
-        if (!response.isSuccessful && response.code != 206) {
-            response.close()
-            throw IOException("HTTP range request failed for $url ($rangeHeader) with code ${response.code}")
+            try {
+                val response = okHttpClient.newCall(request).execute()
+                if (response.isSuccessful || response.code == 206) {
+                    return response
+                }
+                response.close()
+            } catch (e: IOException) {
+                lastException = e
+            }
         }
-        return response
+
+        throw lastException ?: IOException("HTTP range request failed for $filePath ($rangeHeader)")
     }
 
     /**
@@ -153,122 +375,38 @@ class DashcamApiClient(
     @Throws(IOException::class)
     fun openInputStream(filePath: String): Response {
         val normalizedPath = sanitizePath(filePath)
-        val url = buildUrl(normalizedPath)
+        val fileName = normalizedPath.substringAfterLast('/')
+        val parentPath = getParentPath(normalizedPath)
+        val categoryName = parentPath.substringAfterLast('/')
 
-        val request = Request.Builder()
-            .url(url)
-            .get()
-            .build()
+        val candidates = getFileUrlCandidates(categoryName, fileName)
 
-        val response = okHttpClient.newCall(request).execute()
-        if (!response.isSuccessful) {
-            response.close()
-            throw IOException("Failed to open input stream for $url: HTTP ${response.code}")
-        }
-        return response
-    }
+        var lastException: IOException? = null
+        for (url in candidates) {
+            val request = Request.Builder()
+                .url(url)
+                .get()
+                .build()
 
-    /**
-     * Parses HTML directory listings commonly generated by 70mai HTTP servers (lighttpd/busybox httpd/nginx format).
-     * Also falls back to virtual directory structure for root and known subfolders if listing `/`.
-     */
-    internal fun parseHtmlDirectoryListing(parentPath: String, htmlContent: String): List<DashcamFileItem> {
-        val items = mutableListOf<DashcamFileItem>()
-
-        // 1. Regular expression matcher for standard HTML directory index links:
-        // Match e.g. <a href="filename.MP4">filename.MP4</a> or <a href="/sd/normal/2023_0101.MP4">
-        val hrefPattern = Pattern.compile(
-            """<a\s+[^>]*href=["']([^"']+)["'][^>]*>(.*?)</a>""",
-            Pattern.CASE_INSENSITIVE
-        )
-        val matcher = hrefPattern.matcher(htmlContent)
-
-        while (matcher.find()) {
-            val rawHref = matcher.group(1)?.trim() ?: continue
-            val linkText = matcher.group(2)?.replace("<[^>]*>".toRegex(), "")?.trim() ?: rawHref
-
-            // Skip parent directory links and self links
-            if (rawHref == "../" || rawHref == "./" || rawHref.startsWith("?") || linkText == "Parent Directory" || rawHref == "/") {
-                continue
-            }
-
-            val isDir = rawHref.endsWith("/") || !linkText.contains(".")
-            val cleanName = rawHref.trimEnd('/').substringAfterLast('/')
-
-            if (cleanName.isEmpty()) continue
-
-            val itemPath = if (parentPath.endsWith("/")) "$parentPath$cleanName" else "$parentPath/$cleanName"
-            val mimeType = if (isDir) "vnd.android.document/directory" else getMimeTypeForPath(cleanName)
-
-            // Try to extract file size if present in nearby HTML text (e.g., <td>1234567</td> or 20MB)
-            val size = parseSizeFromHtmlRow(htmlContent, rawHref)
-
-            items.add(
-                DashcamFileItem(
-                    name = cleanName,
-                    path = itemPath,
-                    isDirectory = isDir,
-                    size = size,
-                    mimeType = mimeType
-                )
-            )
-        }
-
-        // If root directory requested and HTML list is empty or doesn't expose default subfolders,
-        // guarantee standard 70mai root folders exist so users can navigate to /sd/
-        if (parentPath == "/" && items.none { it.name == "sd" }) {
-            items.add(
-                DashcamFileItem(
-                    name = "sd",
-                    path = "/sd",
-                    isDirectory = true,
-                    mimeType = "vnd.android.document/directory"
-                )
-            )
-        }
-
-        // Standard 70mai SD subfolders if user is in /sd
-        if ((parentPath == "/sd" || parentPath == "/sd/") && items.isEmpty()) {
-            listOf("normal", "event", "photo").forEach { folder ->
-                items.add(
-                    DashcamFileItem(
-                        name = folder,
-                        path = "/sd/$folder",
-                        isDirectory = true,
-                        mimeType = "vnd.android.document/directory"
-                    )
-                )
-            }
-        }
-
-        return items.distinctBy { it.path }
-    }
-
-    private fun parseSizeFromHtmlRow(htmlContent: String, href: String): Long {
-        try {
-            val hrefIndex = htmlContent.indexOf(href)
-            if (hrefIndex != -1) {
-                val snippet = htmlContent.substring(hrefIndex, (hrefIndex + 300).coerceAtMost(htmlContent.length))
-                // Match numbers after href that could represent byte size
-                val sizeMatch = Pattern.compile("""\b(\d{4,12})\b""").matcher(snippet)
-                if (sizeMatch.find()) {
-                    return sizeMatch.group(1)?.toLongOrNull() ?: 0L
+            try {
+                val response = okHttpClient.newCall(request).execute()
+                if (response.isSuccessful) {
+                    return response
                 }
+                response.close()
+            } catch (e: IOException) {
+                lastException = e
             }
-        } catch (e: Exception) {
-            // Ignore parse errors, default size to 0
         }
-        return 0L
-    }
 
-    private fun buildUrl(path: String): String {
-        val cleanPath = if (path.startsWith("/")) path else "/$path"
-        return "$baseUrl$cleanPath"
+        throw lastException ?: IOException("Failed to open input stream for $filePath")
     }
 
     companion object {
         private const val TAG = "DashcamApiClient"
-        const val DEFAULT_BASE_URL = "http://192.168.0.1"
+        const val DEFAULT_HOST = "192.168.0.1"
+        const val DEFAULT_PORT = 80
+        const val DEFAULT_BASE_URL = "http://$DEFAULT_HOST:$DEFAULT_PORT"
 
         fun defaultClient(): OkHttpClient {
             return OkHttpClient.Builder()

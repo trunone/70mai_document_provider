@@ -1,5 +1,7 @@
 package com.mai70.dashcam.net
 
+import com.github.trunone.mai70protocol.Mai70Protocol
+import com.github.trunone.mai70protocol.models.Category
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.After
@@ -19,8 +21,9 @@ class DashcamApiClientTest {
     fun setUp() {
         mockWebServer = MockWebServer()
         mockWebServer.start()
-        val baseUrl = mockWebServer.url("/").toString().trimEnd('/')
-        apiClient = DashcamApiClient(baseUrl = baseUrl)
+        val host = mockWebServer.hostName
+        val port = mockWebServer.port
+        apiClient = DashcamApiClient(host = host, port = port)
     }
 
     @After
@@ -29,58 +32,79 @@ class DashcamApiClientTest {
     }
 
     @Test
-    fun testParseHtmlDirectoryListing() {
-        val htmlContent = """
-            <html>
-            <head><title>Index of /sd/normal/</title></head>
-            <body>
-            <h1>Index of /sd/normal/</h1>
-            <a href="../">Parent Directory</a>
-            <a href="2023_1001_120000.MP4">2023_1001_120000.MP4</a> 10485760
-            <a href="2023_1001_120500.JPG">2023_1001_120500.JPG</a> 2097152
-            <a href="subfolder/">subfolder/</a>
-            </body>
-            </html>
+    fun testProtocolParseFileListResponse() {
+        val jsonResponse = """
+            {
+                "ResultCode": 0,
+                "Result": [
+                    {
+                        "name": "NO20231001-120000.MP4",
+                        "path": "Normal",
+                        "size": "10485760"
+                    },
+                    {
+                        "name": "NO20231001-120500.JPG",
+                        "path": "Normal",
+                        "size": "2097152"
+                    }
+                ]
+            }
         """.trimIndent()
 
-        val items = apiClient.parseHtmlDirectoryListing("/sd/normal", htmlContent)
+        val entries = Mai70Protocol.parseFileListResponse(jsonResponse, Category.NORMAL)
 
-        assertEquals(3, items.size)
+        assertNotNull(entries)
+        assertEquals(2, entries!!.size)
 
-        val videoItem = items.find { it.name == "2023_1001_120000.MP4" }
-        assertNotNull(videoItem)
-        assertEquals("/sd/normal/2023_1001_120000.MP4", videoItem!!.path)
-        assertEquals("video/mp4", videoItem.mimeType)
-        assertFalse(videoItem.isDirectory)
+        val video = entries.find { it.name == "NO20231001-120000.MP4" }
+        assertNotNull(video)
+        assertEquals("Normal", video!!.path)
+        assertEquals(10485760L, video.size)
+        assertEquals(Category.NORMAL, video.category)
 
-        val imageItem = items.find { it.name == "2023_1001_120500.JPG" }
-        assertNotNull(imageItem)
-        assertEquals("image/jpeg", imageItem!!.mimeType)
-
-        val dirItem = items.find { it.name == "subfolder" }
-        assertNotNull(dirItem)
-        assertTrue(dirItem!!.isDirectory)
-        assertEquals("vnd.android.document/directory", dirItem.mimeType)
+        val photo = entries.find { it.name == "NO20231001-120500.JPG" }
+        assertNotNull(photo)
+        assertEquals(2097152L, photo!!.size)
     }
 
     @Test
-    fun testListDirectoryNetworkCall() {
-        val htmlContent = """
-            <a href="2023_1001_120000.MP4">2023_1001_120000.MP4</a>
+    fun testListDirectoryProtocolCall() {
+        val jsonResponse = """
+            {
+                "ResultCode": 0,
+                "Result": [
+                    {
+                        "name": "NO20231001-120000.MP4",
+                        "path": "Normal",
+                        "size": "10485760"
+                    }
+                ]
+            }
         """.trimIndent()
 
-        mockWebServer.enqueue(
-            MockResponse()
-                .setResponseCode(200)
-                .setBody(htmlContent)
-        )
+        // 1. client.cgi register call
+        mockWebServer.enqueue(MockResponse().setResponseCode(200).setBody("""{"ResultCode":0}"""))
+        // 2. setaccessalbum.cgi call
+        mockWebServer.enqueue(MockResponse().setResponseCode(200).setBody("""{"ResultCode":0}"""))
+        // 3. getfilelist.cgi call
+        mockWebServer.enqueue(MockResponse().setResponseCode(200).setBody(jsonResponse))
 
-        val items = apiClient.listDirectory("/sd/normal")
+        val items = apiClient.listDirectory("/Normal")
         assertEquals(1, items.size)
-        assertEquals("2023_1001_120000.MP4", items[0].name)
+        assertEquals("NO20231001-120000.MP4", items[0].name)
+        assertEquals("/Normal/NO20231001-120000.MP4", items[0].path)
+        assertEquals("video/mp4", items[0].mimeType)
+        assertFalse(items[0].isDirectory)
 
-        val request = mockWebServer.takeRequest()
-        assertEquals("/sd/normal", request.path)
+        val req1 = mockWebServer.takeRequest()
+        assertTrue(req1.path!!.contains("client.cgi"))
+
+        val req2 = mockWebServer.takeRequest()
+        assertTrue(req2.path!!.contains("setaccessalbum.cgi"))
+
+        val req3 = mockWebServer.takeRequest()
+        assertTrue(req3.path!!.contains("getfilelist.cgi"))
+        assertTrue(req3.path!!.contains("-type=0"))
     }
 
     @Test
@@ -88,11 +112,11 @@ class DashcamApiClientTest {
         mockWebServer.enqueue(
             MockResponse()
                 .setResponseCode(206)
-                .setHeader("Content-Range", "bytes 0-99/1000")
+                .setHeader("Content-Range", "bytes 0-9/1000")
                 .setBody("0123456789")
         )
 
-        val response = apiClient.openRangeStream("/sd/normal/test.mp4", 0, 10)
+        val response = apiClient.openRangeStream("/Normal/NO20231001-120000.MP4", 0, 10)
         assertEquals(206, response.code)
 
         val bodyString = response.body?.string()
@@ -104,7 +128,7 @@ class DashcamApiClientTest {
 
     @Test
     fun testGetMimeTypeForPath() {
-        assertEquals("video/mp4", DashcamApiClient.getMimeTypeForPath("/sd/normal/file.MP4"))
+        assertEquals("video/mp4", DashcamApiClient.getMimeTypeForPath("/Normal/file.MP4"))
         assertEquals("image/jpeg", DashcamApiClient.getMimeTypeForPath("photo.JPG"))
         assertEquals("image/png", DashcamApiClient.getMimeTypeForPath("snapshot.png"))
         assertEquals("application/octet-stream", DashcamApiClient.getMimeTypeForPath("unknown.dat"))

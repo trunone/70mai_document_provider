@@ -1,0 +1,3 @@
+[submodule "70mai_file_protocaol"]
+	path = 70mai_file_protocaol
+	url = https://github.com/trunone/70mai_file_protocaol.git
