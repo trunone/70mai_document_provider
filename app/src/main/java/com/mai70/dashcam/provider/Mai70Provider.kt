@@ -79,7 +79,7 @@ class Mai70Provider : DocumentsProvider() {
             row.add(DocumentsContract.Document.COLUMN_DISPLAY_NAME, "70mai Dashcam")
             row.add(DocumentsContract.Document.COLUMN_SIZE, 0L)
             row.add(DocumentsContract.Document.COLUMN_MIME_TYPE, DocumentsContract.Document.MIME_TYPE_DIR)
-            row.add(DocumentsContract.Document.COLUMN_FLAGS, 0)
+            row.add(DocumentsContract.Document.COLUMN_FLAGS, DocumentsContract.Document.FLAG_DIR_PREFERS_GRID)
             row.add(DocumentsContract.Document.COLUMN_LAST_MODIFIED, System.currentTimeMillis())
             return result
         }
@@ -251,7 +251,9 @@ class Mai70Provider : DocumentsProvider() {
         val docId = pathToDocumentId(item.path)
 
         var flags = 0
-        if (!item.isDirectory) {
+        if (item.isDirectory) {
+            flags = flags or DocumentsContract.Document.FLAG_DIR_PREFERS_GRID
+        } else {
             flags = flags or DocumentsContract.Document.FLAG_SUPPORTS_THUMBNAIL
         }
 
