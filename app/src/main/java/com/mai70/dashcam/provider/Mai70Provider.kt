@@ -60,6 +60,7 @@ class Mai70Provider : DocumentsProvider() {
         row.add(
             DocumentsContract.Root.COLUMN_FLAGS,
             DocumentsContract.Root.FLAG_SUPPORTS_IS_CHILD or
+                    DocumentsContract.Root.FLAG_SUPPORTS_SEARCH or
                     DocumentsContract.Root.FLAG_LOCAL_ONLY
         )
         row.add(DocumentsContract.Root.COLUMN_MIME_TYPES, "*/*")
@@ -78,7 +79,7 @@ class Mai70Provider : DocumentsProvider() {
             row.add(DocumentsContract.Document.COLUMN_DISPLAY_NAME, "70mai Dashcam")
             row.add(DocumentsContract.Document.COLUMN_SIZE, 0L)
             row.add(DocumentsContract.Document.COLUMN_MIME_TYPE, DocumentsContract.Document.MIME_TYPE_DIR)
-            row.add(DocumentsContract.Document.COLUMN_FLAGS, 0)
+            row.add(DocumentsContract.Document.COLUMN_FLAGS, DocumentsContract.Document.FLAG_DIR_PREFERS_GRID)
             row.add(DocumentsContract.Document.COLUMN_LAST_MODIFIED, System.currentTimeMillis())
             return result
         }
@@ -213,12 +214,46 @@ class Mai70Provider : DocumentsProvider() {
         }
     }
 
+    override fun isChildDocument(parentDocumentId: String, documentId: String): Boolean {
+        if (parentDocumentId == documentId) return false
+        val parentPath = DashcamApiClient.sanitizePath(documentIdToPath(parentDocumentId))
+        val childPath = DashcamApiClient.sanitizePath(documentIdToPath(documentId))
+
+        if (parentPath == "/") {
+            return childPath != "/" && childPath.isNotEmpty()
+        }
+
+        val parentPrefix = if (parentPath.endsWith("/")) parentPath else "$parentPath/"
+        return childPath.startsWith(parentPrefix)
+    }
+
+    override fun findDocumentPath(parentDocumentId: String?, childDocumentId: String): DocumentsContract.Path {
+        val pathList = mutableListOf<String>()
+        val childPath = DashcamApiClient.sanitizePath(documentIdToPath(childDocumentId))
+
+        // Start at root
+        pathList.add(DOC_ID_ROOT)
+
+        if (childPath != "/" && childPath.isNotEmpty()) {
+            val segments = childPath.trim('/').split('/').filter { it.isNotEmpty() }
+            var currentPath = ""
+            for (segment in segments) {
+                currentPath += "/$segment"
+                pathList.add(pathToDocumentId(currentPath))
+            }
+        }
+
+        return DocumentsContract.Path(ROOT_ID, pathList)
+    }
+
     private fun appendDocumentRow(cursor: MatrixCursor, item: DashcamFileItem) {
         val row = cursor.newRow()
         val docId = pathToDocumentId(item.path)
 
         var flags = 0
-        if (!item.isDirectory) {
+        if (item.isDirectory) {
+            flags = flags or DocumentsContract.Document.FLAG_DIR_PREFERS_GRID
+        } else {
             flags = flags or DocumentsContract.Document.FLAG_SUPPORTS_THUMBNAIL
         }
 
