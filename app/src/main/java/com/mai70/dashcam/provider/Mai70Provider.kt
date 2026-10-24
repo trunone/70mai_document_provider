@@ -60,6 +60,7 @@ class Mai70Provider : DocumentsProvider() {
         row.add(
             DocumentsContract.Root.COLUMN_FLAGS,
             DocumentsContract.Root.FLAG_SUPPORTS_IS_CHILD or
+                    DocumentsContract.Root.FLAG_SUPPORTS_SEARCH or
                     DocumentsContract.Root.FLAG_LOCAL_ONLY
         )
         row.add(DocumentsContract.Root.COLUMN_MIME_TYPES, "*/*")
@@ -211,6 +212,38 @@ class Mai70Provider : DocumentsProvider() {
                 Log.w(TAG, "Could not bind process to 70mai Wi-Fi hotspot. Continuing with default network.")
             }
         }
+    }
+
+    override fun isChildDocument(parentDocumentId: String, documentId: String): Boolean {
+        if (parentDocumentId == documentId) return false
+        val parentPath = DashcamApiClient.sanitizePath(documentIdToPath(parentDocumentId))
+        val childPath = DashcamApiClient.sanitizePath(documentIdToPath(documentId))
+
+        if (parentPath == "/") {
+            return childPath != "/" && childPath.isNotEmpty()
+        }
+
+        val parentPrefix = if (parentPath.endsWith("/")) parentPath else "$parentPath/"
+        return childPath.startsWith(parentPrefix)
+    }
+
+    override fun findDocumentPath(parentDocumentId: String?, childDocumentId: String): DocumentsContract.Path {
+        val pathList = mutableListOf<String>()
+        val childPath = DashcamApiClient.sanitizePath(documentIdToPath(childDocumentId))
+
+        // Start at root
+        pathList.add(DOC_ID_ROOT)
+
+        if (childPath != "/" && childPath.isNotEmpty()) {
+            val segments = childPath.trim('/').split('/').filter { it.isNotEmpty() }
+            var currentPath = ""
+            for (segment in segments) {
+                currentPath += "/$segment"
+                pathList.add(pathToDocumentId(currentPath))
+            }
+        }
+
+        return DocumentsContract.Path(ROOT_ID, pathList)
     }
 
     private fun appendDocumentRow(cursor: MatrixCursor, item: DashcamFileItem) {

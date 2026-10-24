@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.pm.ProviderInfo
 import android.provider.DocumentsContract
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -64,6 +65,28 @@ class Mai70ProviderTest {
 
         assertEquals("mai70_root", rootId)
         assertEquals("70mai Dashcam", title)
+    }
+
+    @Test
+    fun testIsChildDocument() {
+        assertTrue(provider.isChildDocument("root", "doc:/Normal"))
+        assertTrue(provider.isChildDocument("root", "doc:/Normal/video.mp4"))
+        assertTrue(provider.isChildDocument("doc:/Normal", "doc:/Normal/video.mp4"))
+        assertFalse(provider.isChildDocument("doc:/Normal", "doc:/Event/video.mp4"))
+        assertFalse(provider.isChildDocument("doc:/Normal", "doc:/Normal"))
+    }
+
+    @Test
+    fun testFindDocumentPath() {
+        val path = provider.findDocumentPath("root", "doc:/Normal/2023_0101.MP4")
+        assertNotNull(path)
+        assertEquals("mai70_root", path.rootId)
+
+        val pathList = path.path
+        assertEquals(3, pathList.size)
+        assertEquals("root", pathList[0])
+        assertEquals("doc:/Normal", pathList[1])
+        assertEquals("doc:/Normal/2023_0101.MP4", pathList[2])
     }
 
     @Test
