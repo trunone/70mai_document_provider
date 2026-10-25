@@ -133,4 +133,36 @@ class DashcamApiClientTest {
         assertEquals("image/png", DashcamApiClient.getMimeTypeForPath("snapshot.png"))
         assertEquals("application/octet-stream", DashcamApiClient.getMimeTypeForPath("unknown.dat"))
     }
+
+    @Test
+    fun testGetThumbnailUrlCandidates() {
+        val candidates = apiClient.getThumbnailUrlCandidates("Normal", "NO20231001-120000.MP4")
+        assertTrue(candidates.isNotEmpty())
+        assertTrue(candidates.any { it.contains("getthumbnail.cgi") || it.contains("NO20231001-120000.THM") })
+    }
+
+    @Test
+    fun testOpenThumbnailInputStream() {
+        // 1. client.cgi register call
+        mockWebServer.enqueue(MockResponse().setResponseCode(200).setBody("""{"ResultCode":0}"""))
+        // 2. setaccessalbum.cgi call
+        mockWebServer.enqueue(MockResponse().setResponseCode(200).setBody("""{"ResultCode":0}"""))
+        // 3. thumbnail request call (first candidate returning 200 JPEG binary)
+        val mockImageData = byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte(), 0xE0.toByte())
+        mockWebServer.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "image/jpeg")
+                .setBody(okio.Buffer().write(mockImageData))
+        )
+
+        val response = apiClient.openThumbnailInputStream("/Normal/NO20231001-120000.MP4")
+        assertNotNull(response)
+        assertEquals(200, response.code)
+        val readBytes = response.body?.byteStream()?.readBytes()
+        assertNotNull(readBytes)
+        assertTrue(readBytes!!.size >= 4)
+        assertEquals(0xFF.toByte(), readBytes[0])
+        assertEquals(0xD8.toByte(), readBytes[1])
+    }
 }

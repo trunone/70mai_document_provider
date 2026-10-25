@@ -282,6 +282,78 @@ class DashcamApiClient(
     }
 
     /**
+     * Builds candidate HTTP thumbnail URLs for a file.
+     *
+     * Generates signed CGI thumbnail endpoint URLs as well as direct static HTTP thumbnail file candidates.
+     *
+     * @param categoryName Folder/category name (e.g. "Normal").
+     * @param fileName File name (e.g. "NO20240101-120000-000100.MP4").
+     * @param remotePath Optional remote directory path as reported by camera.
+     * @return List of distinct candidate URLs for retrieving the file's thumbnail.
+     */
+    fun getThumbnailUrlCandidates(
+        categoryName: String,
+        fileName: String,
+        remotePath: String? = null
+    ): List<String> {
+        val candidates = mutableListOf<String>()
+        val cleanCategory = categoryName.removePrefix("/").removeSuffix("/")
+        val cacheKey = "$host:$port/$cleanCategory/$fileName"
+        val cachedEntry = fileEntriesCache[cacheKey]
+
+        val authority = getAuthority()
+        val timestamp = System.currentTimeMillis() / 1000L
+
+        val paths = mutableListOf<String>()
+        if (cachedEntry != null) {
+            paths.add(cachedEntry.path.removePrefix("/").removeSuffix("/"))
+        }
+        if (!remotePath.isNullOrEmpty()) {
+            paths.add(remotePath.removePrefix("/").removeSuffix("/"))
+        }
+        paths.add(cleanCategory)
+        paths.add("sd/$cleanCategory")
+        paths.add("")
+
+        val distinctPaths = paths.distinct()
+
+        // 1. Signed CGI endpoints
+        val cgiPaths = listOf("getthumbnail.cgi?", "getthumb.cgi?", "getfilethumb.cgi?")
+        for (p in distinctPaths) {
+            for (cgi in cgiPaths) {
+                if (p.isNotEmpty()) {
+                    candidates.add(Mai70Protocol.buildCgiUrl(authority, cgi, "-path=$p&-name=$fileName&-timestamp=$timestamp"))
+                } else {
+                    candidates.add(Mai70Protocol.buildCgiUrl(authority, cgi, "-name=$fileName&-timestamp=$timestamp"))
+                }
+            }
+        }
+
+        // 2. Direct static HTTP candidates
+        val baseName = if (fileName.contains('.')) fileName.substringBeforeLast('.') else fileName
+        val thmNameCandidates = listOf(
+            "$baseName.THM",
+            "$baseName.thm",
+            "$baseName.JPG",
+            "$baseName.jpg",
+            "${baseName}_THUMB.JPG",
+            "${baseName}_thm.jpg",
+            fileName
+        ).distinct()
+
+        for (p in distinctPaths) {
+            val prefix = if (p.isEmpty()) "" else "$p/"
+            for (thmName in thmNameCandidates) {
+                candidates.add("http://$host:$port/${prefix}THUMB/$thmName")
+                candidates.add("http://$host:$port/${prefix}.THUMB/$thmName")
+                candidates.add("http://$host:$port/$prefix$thmName")
+            }
+        }
+
+        return candidates.distinct()
+    }
+
+    /**
      * Queries metadata for a specific file path on the dashcam.
      */
     @Throws(IOException::class)
@@ -400,6 +472,53 @@ class DashcamApiClient(
         }
 
         throw lastException ?: IOException("Failed to open input stream for $filePath")
+    }
+
+    /**
+     * Direct input stream download for a file thumbnail.
+     */
+    @Throws(IOException::class)
+    fun openThumbnailInputStream(filePath: String): Response {
+        prepareCameraAccess()
+        val normalizedPath = sanitizePath(filePath)
+        val fileName = normalizedPath.substringAfterLast('/')
+        val parentPath = getParentPath(normalizedPath)
+        val categoryName = parentPath.substringAfterLast('/')
+
+        val candidates = getThumbnailUrlCandidates(categoryName, fileName)
+
+        var lastException: IOException? = null
+        for (url in candidates) {
+            val request = Request.Builder()
+                .url(url)
+                .get()
+                .build()
+
+            try {
+                val response = okHttpClient.newCall(request).execute()
+                if (response.isSuccessful) {
+                    val body = response.body
+                    if (body != null) {
+                        val source = body.source()
+                        source.request(512)
+                        val buffer = source.buffer.clone()
+                        val headerText = buffer.readUtf8()
+                        if (headerText.trimStart().startsWith("{") &&
+                            (headerText.contains("ResultCode") || headerText.contains("status") || headerText.contains("Result"))
+                        ) {
+                            response.close()
+                            continue
+                        }
+                        return response
+                    }
+                }
+                response.close()
+            } catch (e: IOException) {
+                lastException = e
+            }
+        }
+
+        throw lastException ?: IOException("Failed to open thumbnail stream for $filePath")
     }
 
     companion object {
