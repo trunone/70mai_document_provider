@@ -1,7 +1,9 @@
 package com.mai70.dashcam.provider
 
+import android.content.res.AssetFileDescriptor
 import android.database.Cursor
 import android.database.MatrixCursor
+import android.graphics.Point
 import android.os.Build
 import android.os.CancellationSignal
 import android.os.Handler
@@ -19,6 +21,7 @@ import com.mai70.dashcam.net.DashcamNetworkManager
 import okhttp3.Response
 import java.io.File
 import java.io.FileNotFoundException
+import java.io.FileOutputStream
 import java.io.IOException
 
 /**
@@ -152,6 +155,53 @@ class Mai70Provider : DocumentsProvider() {
         } else {
             openLocalCacheDescriptor(relativePath)
         }
+    }
+
+    override fun openDocumentThumbnail(
+        documentId: String,
+        sizeHint: Point?,
+        signal: CancellationSignal?
+    ): AssetFileDescriptor {
+        ensureNetworkBound()
+        Log.d(TAG, "openDocumentThumbnail requested for docId=$documentId")
+
+        val relativePath = documentIdToPath(documentId)
+        val ctx = context ?: throw FileNotFoundException("Context missing")
+
+        val safeFileName = relativePath.replace('/', '_').replace('\\', '_')
+        val cacheDir = File(ctx.cacheDir, "dashcam_thumbnails")
+        if (!cacheDir.exists()) {
+            cacheDir.mkdirs()
+        }
+        val thumbnailFile = File(cacheDir, "thumb_$safeFileName.jpg")
+
+        if (!thumbnailFile.exists() || thumbnailFile.length() == 0L) {
+            try {
+                apiClient.openThumbnailInputStream(relativePath).use { response ->
+                    val body = response.body
+                        ?: throw FileNotFoundException("Thumbnail response body empty for $relativePath")
+                    body.byteStream().use { input ->
+                        FileOutputStream(thumbnailFile).use { output ->
+                            input.copyTo(output)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to download thumbnail for $relativePath", e)
+                if (thumbnailFile.exists()) {
+                    thumbnailFile.delete()
+                }
+                val fnf = FileNotFoundException("Could not retrieve thumbnail for $relativePath")
+                fnf.initCause(e)
+                throw fnf
+            }
+        }
+
+        val pfd = ParcelFileDescriptor.open(
+            thumbnailFile,
+            ParcelFileDescriptor.MODE_READ_ONLY
+        )
+        return AssetFileDescriptor(pfd, 0, thumbnailFile.length())
     }
 
     @RequiresApi(Build.VERSION_CODES.O)

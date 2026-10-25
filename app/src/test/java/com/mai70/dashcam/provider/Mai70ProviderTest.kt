@@ -105,4 +105,18 @@ class Mai70ProviderTest {
         assertEquals("70mai Dashcam", displayName)
         assertEquals(DocumentsContract.Document.MIME_TYPE_DIR, mimeType)
     }
+
+    @Test
+    fun testOpenDocumentThumbnailWhenCached() {
+        val safeFileName = "_Normal_NO20231001-120000.MP4"
+        val cacheDir = java.io.File(context.cacheDir, "dashcam_thumbnails")
+        cacheDir.mkdirs()
+        val thumbFile = java.io.File(cacheDir, "thumb_$safeFileName.jpg")
+        thumbFile.writeBytes(byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte(), 0xE0.toByte()))
+
+        val afd = provider.openDocumentThumbnail("doc:/Normal/NO20231001-120000.MP4", null, null)
+        assertNotNull(afd)
+        assertNotNull(afd.parcelFileDescriptor)
+        assertTrue(afd.length == -1L || afd.length > 0)
+    }
 }
